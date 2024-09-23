@@ -3,9 +3,7 @@ from rest_framework.response import Response
 from django.contrib.auth.models import User
 from rest_framework.permissions import AllowAny
 from rest_framework_simplejwt.tokens import RefreshToken
-from .serializers import RegisterSerializer, LoginSerializer
-
-from rest_framework.decorators import api_view
+from .serializers import RegisterSerializer, LoginSerializer,TransactionSerializer
 from .models import GoldHolding, Transaction
 from .utils import convert_grams_to_currency, apply_commission, check_user_balance
 import requests
@@ -13,6 +11,11 @@ import redis
 from django.core.cache import cache
 from django.conf import settings
 from rest_framework.decorators import api_view
+from threading import Thread, Lock
+from django.db import transaction
+
+lock = Lock()
+
 
 # Redis configuration
 REDIS_TTL = 300  # Time-to-Live in seconds (5 minutes)
@@ -98,6 +101,7 @@ def fetch_current_gold_price():
     
     return data.get('price')
 
+
 @api_view(['POST'])
 def buy_gold(request):
     user = request.user
@@ -106,41 +110,42 @@ def buy_gold(request):
     if not grams_to_buy:
         return Response({'error': 'Grams field is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Fetch the current gold price from API
     try:
         gold_price_per_gram = fetch_current_gold_price()
     except requests.RequestException as e:
         return Response({'error': 'Failed to fetch gold price.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    # Convert grams to currency
     amount_to_pay = convert_grams_to_currency(grams_to_buy, gold_price_per_gram)
-
-    # Apply commission
     total_amount_with_commission = apply_commission(amount_to_pay, COMMISSION_RATE)
 
-    # Check if the user has enough balance
     if not check_user_balance(user, total_amount_with_commission):
         return Response({'error': 'Insufficient balance.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Deduct the amount from user's balance
-    user.goldholding.balance_in_currency -= total_amount_with_commission
-    user.goldholding.gold_in_grams += float(grams_to_buy)
-    user.goldholding.save()
+    def process_transaction():
+        with lock:
+            with transaction.atomic():
+                user.goldholding.balance_in_currency -= total_amount_with_commission
+                user.goldholding.gold_in_grams += float(grams_to_buy)
+                user.goldholding.save()
 
-    # Log the transaction
-    Transaction.objects.create(
-        user=user,
-        transaction_type='buy',
-        gold_in_grams=grams_to_buy,
-        amount_in_currency=amount_to_pay,
-        commission_applied=total_amount_with_commission - amount_to_pay
-    )
+                Transaction.objects.create(
+                    user=user,
+                    transaction_type='buy',
+                    gold_in_grams=grams_to_buy,
+                    amount_in_currency=amount_to_pay,
+                    commission_applied=total_amount_with_commission - amount_to_pay
+                )
+
+    transaction_thread = Thread(target=process_transaction)
+    transaction_thread.start()
+    transaction_thread.join()
 
     return Response({
         'message': f'Successfully bought {grams_to_buy} grams of gold.',
         'total_amount': total_amount_with_commission,
         'remaining_balance': user.goldholding.balance_in_currency,
     }, status=status.HTTP_200_OK)
+
 
 @api_view(['POST'])
 def sell_gold(request):
@@ -153,34 +158,42 @@ def sell_gold(request):
     if user.goldholding.gold_in_grams < float(grams_to_sell):
         return Response({'error': 'Insufficient gold balance.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Fetch the current gold price from API
     try:
         gold_price_per_gram = fetch_current_gold_price()
     except requests.RequestException as e:
         return Response({'error': 'Failed to fetch gold price.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    # Convert grams to currency
     amount_to_receive = convert_grams_to_currency(grams_to_sell, gold_price_per_gram)
-
-    # Apply commission
     total_amount_with_commission = apply_commission(amount_to_receive, COMMISSION_RATE)
 
-    # Add the amount to user's balance and deduct gold from their holdings
-    user.goldholding.balance_in_currency += total_amount_with_commission
-    user.goldholding.gold_in_grams -= float(grams_to_sell)
-    user.goldholding.save()
+    def process_transaction():
+        with lock:
+            with transaction.atomic():
+                user.goldholding.balance_in_currency += total_amount_with_commission
+                user.goldholding.gold_in_grams -= float(grams_to_sell)
+                user.goldholding.save()
 
-    # Log the transaction
-    Transaction.objects.create(
-        user=user,
-        transaction_type='sell',
-        gold_in_grams=grams_to_sell,
-        amount_in_currency=amount_to_receive,
-        commission_applied=total_amount_with_commission - amount_to_receive
-    )
+                Transaction.objects.create(
+                    user=user,
+                    transaction_type='sell',
+                    gold_in_grams=grams_to_sell,
+                    amount_in_currency=amount_to_receive,
+                    commission_applied=total_amount_with_commission - amount_to_receive
+                )
+
+    transaction_thread = Thread(target=process_transaction)
+    transaction_thread.start()
+    transaction_thread.join()
 
     return Response({
         'message': f'Successfully sold {grams_to_sell} grams of gold.',
         'total_amount_received': total_amount_with_commission,
         'remaining_balance': user.goldholding.balance_in_currency,
     }, status=status.HTTP_200_OK)
+
+@api_view(['GET'])
+def get_transaction_history(request):
+    user = request.user
+    transactions = Transaction.objects.filter(user=user).order_by('-date')
+    serializer = TransactionSerializer(transactions, many=True)
+    return serializer.data

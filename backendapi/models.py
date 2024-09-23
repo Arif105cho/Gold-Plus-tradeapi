@@ -21,3 +21,4 @@ class Transaction(models.Model):
     amount_in_currency = models.DecimalField(max_digits=12, decimal_places=2)
     commission_applied = models.DecimalField(max_digits=5, decimal_places=2)
     timestamp = models.DateTimeField(auto_now_add=True)
+

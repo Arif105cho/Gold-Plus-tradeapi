@@ -24,6 +24,7 @@ urlpatterns = [
     path('gold-price/', views.get_gold_price, name='gold-price'),
     path('buy-gold/', views.buy_gold, name='buy-gold'),
     path('sell-gold/', views.sell_gold, name='sell-gold'),
+    path('transection-history',views.get_transaction_history),
     path('admin',admin.site.urls)
 
 ]
